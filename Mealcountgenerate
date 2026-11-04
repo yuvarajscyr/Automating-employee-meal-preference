@@ -1,0 +1,264 @@
+/**
+ * E2E DAILY MEAL LIST AUTOMATION
+ * ================================
+ * Reads tomorrow's Breakfast / Lunch / Dinner Y/N marks from the food sheet
+ * and sends the formatted list to your WhatsApp group(s) via Green API.
+ * (A backup email is still sent if the WhatsApp send fails.)
+ * Skips entirely on any date listed in SKIP_DATES (holidays, no canteen).
+ */
+
+// ---------- CONFIG ----------
+var SPREADSHEET_ID = '1BM4VOsMs2FYWf7dCYCm0RQ-942XoEYMEke_WZH9jc0A';
+var SHEET_GID = 1753694936;          // from the sheet URL (#gid=...)
+var EMAIL_TO = 's.yuvaraj@e2enetworks.com'; // fallback only
+
+var GREEN_API_ID_INSTANCE = '710722761902';
+var GREEN_API_TOKEN = '';
+var WHATSAPP_GROUP_CHAT_IDS = [
+  '120363424258597876@g.us',
+  '919585190687@c.us',
+];
+
+// Dates (tomorrow's date) to skip entirely — no message sent at all.
+// Format: 'YYYY-MM-DD'. Add one line per holiday, in advance.
+var SKIP_DATES = [
+  '2026-11-07' // diwali— no canteen
+];
+// -----------------------------
+
+function generateMealList() {
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var sheet = getSheetByGid_(ss, SHEET_GID);
+  var data = sheet.getDataRange().getDisplayValues();
+
+  var tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  // --- NEW: skip entirely if tomorrow is a listed holiday ---
+  var tomorrowKey = Utilities.formatDate(tomorrow, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  if (SKIP_DATES.indexOf(tomorrowKey) !== -1) {
+    return; // no WhatsApp message, no email — script does nothing today
+  }
+  // -----------------------------------------------------------
+
+  var targetDay = tomorrow.getDate();
+  var targetMonth = tomorrow.getMonth() + 1; // 1-12
+  var targetYear = tomorrow.getFullYear();
+
+  var names = { BF: [], L: [], D: [] };
+
+  var colMap = null; // {colIndex: {day, meal}}
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+
+    // A new "Employee No" row marks the header for the block below it.
+    if (row[0] === 'Employee No') {
+      var header1 = data[i - 1] || [];
+      var header2 = row;
+      colMap = buildColMap_(header1, header2);
+      continue;
+    }
+
+    // Regular employee data row, e.g. "E2E124"
+    if (/^E2E\d+/i.test(row[0])) {
+      var month = parseInt(row[2], 10);
+      var year = parseInt(row[3], 10);
+      if (month !== targetMonth || year !== targetYear) continue;
+      if (!colMap) continue;
+
+      var empName = row[1];
+      for (var c in colMap) {
+        var info = colMap[c];
+        if (info.day !== targetDay) continue;
+        var val = (row[c] || '').trim().toUpperCase();
+        if (val === 'Y') {
+          names[info.meal].push(empName);
+        }
+      }
+      continue;
+    }
+
+    // Vendor/Visitor row: the cell itself holds one or more names
+    // (comma or newline separated) instead of a Y/N flag against a
+    // single Employee Names column. The label lives in column B
+    // (Employee Names), not column A (Employee No), which may be blank.
+    if (isVendorRow_(row[1])) {
+      var vMonth = parseInt(row[2], 10);
+      var vYear = parseInt(row[3], 10);
+      var vendorMonthYearGiven = !isNaN(vMonth) && !isNaN(vYear);
+      if (vendorMonthYearGiven && (vMonth !== targetMonth || vYear !== targetYear)) continue;
+      if (!colMap) continue;
+
+      for (var vc in colMap) {
+        var vInfo = colMap[vc];
+        if (vInfo.day !== targetDay) continue;
+        var cellText = (row[vc] || '').trim();
+        if (!cellText) continue;
+        var extraNames = parseNameList_(cellText);
+        extraNames.forEach(function(n) { names[vInfo.meal].push(n); });
+      }
+    }
+  }
+
+  var dateStr = formatOrdinalDate_(tomorrow);
+  var body = buildMessage_(dateStr, names);
+
+  sendMealListToWhatsapp(body);
+}
+
+// Build a column -> {day, meal} map by forward-filling merged header cells.
+function buildColMap_(header1, header2) {
+  var map = {};
+  var lastLabel = '';
+  var lastDay = null;
+  var width = Math.max(header1.length, header2.length);
+  for (var c = 4; c < width; c++) { // columns E onward (0-indexed 4)
+    var l1 = (header1[c] || '').trim();
+    if (l1 !== '') lastLabel = l1;
+
+    var l2 = (header2[c] || '').trim();
+    if (l2 !== '') lastDay = l2;
+
+    if (lastLabel === 'BF' || lastLabel === 'L' || lastLabel === 'D') {
+      var dayNum = parseInt(String(lastDay).replace(/[^\d]/g, ''), 10);
+      if (!isNaN(dayNum)) {
+        map[c] = { day: dayNum, meal: lastLabel };
+      }
+    }
+  }
+  return map;
+}
+
+function getSheetByGid_(ss, gid) {
+  var sheets = ss.getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].getSheetId() === gid) return sheets[i];
+  }
+  throw new Error('Sheet with gid ' + gid + ' not found');
+}
+
+// DEBUG ONLY — run this manually from the function dropdown, then
+// View -> Logs (or Executions) to see exactly what row 39 contains
+// and whether it's being recognized correctly.
+function debugRow39() {
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var sheet = getSheetByGid_(ss, SHEET_GID);
+  var lastCol = sheet.getLastColumn();
+  var row39 = sheet.getRange(39, 1, 1, lastCol).getDisplayValues()[0];
+
+  Logger.log('A39 (Employee No): "' + row39[0] + '"');
+  Logger.log('B39 (Employee Names): "' + row39[1] + '"');
+  Logger.log('C39 (Month): "' + row39[2] + '"');
+  Logger.log('D39 (Year): "' + row39[3] + '"');
+  Logger.log('isVendorRow_(B39) = ' + isVendorRow_(row39[1]));
+
+  var header1 = sheet.getRange(sheet.getLastRow() > 0 ? findHeaderRowAbove_(sheet, 39) - 1 : 1, 1, 1, lastCol).getDisplayValues()[0];
+  var header2 = sheet.getRange(findHeaderRowAbove_(sheet, 39), 1, 1, lastCol).getDisplayValues()[0];
+  var colMap = buildColMap_(header1, header2);
+
+  for (var c = 4; c < lastCol; c++) {
+    if (row39[c] && row39[c].trim() !== '') {
+      var info = colMap[c];
+      var mapped = info ? ('day ' + info.day + ', meal ' + info.meal) : 'NOT MAPPED';
+      Logger.log('Column ' + (c + 1) + ' (index ' + c + '): "' + row39[c] + '" -> ' + mapped);
+    }
+  }
+
+  var tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  Logger.log('Tomorrow is day ' + tomorrow.getDate() + ', month ' + (tomorrow.getMonth() + 1) + ', year ' + tomorrow.getFullYear());
+}
+
+function findHeaderRowAbove_(sheet, fromRow) {
+  var colA = sheet.getRange(1, 1, fromRow, 1).getDisplayValues();
+  for (var k = fromRow - 1; k >= 1; k--) {
+    if (colA[k - 1][0] === 'Employee No') return k;
+  }
+  return 1;
+}
+
+function isVendorRow_(label) {
+  return String(label || '').trim().toLowerCase() === 'e2e vendor/visitor';
+}
+
+function parseNameList_(text) {
+  return text
+    .split(/[,\n]/)
+    .map(function(n) { return n.trim(); })
+    .filter(function(n) { return n.length > 0; });
+}
+
+function formatOrdinalDate_(date) {
+  var day = date.getDate();
+  var suffix = 'th';
+  if (day % 10 === 1 && day !== 11) suffix = 'st';
+  else if (day % 10 === 2 && day !== 12) suffix = 'nd';
+  else if (day % 10 === 3 && day !== 13) suffix = 'rd';
+  var months = ['January','February','March','April','May','June','July',
+                'August','September','October','November','December'];
+  return day + suffix + ' ' + months[date.getMonth()] + ' ' + date.getFullYear();
+}
+
+function buildMessage_(dateStr, names) {
+  var lines = ['Meal count for E2E', ''];
+
+  lines.push('Breakfast');
+  lines.push(dateStr);
+  lines = lines.concat(mealBlock_(names.BF));
+  lines.push('');
+
+  lines.push('Lunch');
+  lines.push(dateStr);
+  lines = lines.concat(mealBlock_(names.L));
+  lines.push('');
+
+  lines.push('Dinner');
+  lines.push(dateStr);
+  lines = lines.concat(mealBlock_(names.D));
+
+  return lines.join('\n');
+}
+
+function mealBlock_(list) {
+  if (list.length === 0) return ['Nil'];
+  return [list.length + ' Qty', list.join(', ') + '.'];
+}
+
+// ---------- WhatsApp send via Green API ----------
+function sendMealListToWhatsapp(message) {
+  var failures = [];
+
+  WHATSAPP_GROUP_CHAT_IDS.forEach(function(chatId) {
+    var url = 'https://7107.api.green-api.com/waInstance' + GREEN_API_ID_INSTANCE +
+              '/sendMessage/' + GREEN_API_TOKEN;
+
+    var payload = {
+      chatId: chatId,
+      message: message
+    };
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
+
+    if (code !== 200) {
+      failures.push(chatId + ' -> ' + code + ': ' + response.getContentText());
+    }
+  });
+
+  if (failures.length > 0) {
+    MailApp.sendEmail({
+      to: EMAIL_TO,
+      subject: 'WhatsApp send FAILED for ' + failures.length + ' group(s) — meal list',
+      body: 'Failures:\n' + failures.join('\n\n') +
+            '\n\n--- Message that failed to send ---\n' + message
+    });
+  }
+}
+
