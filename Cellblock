@@ -1,0 +1,169 @@
+/**
+* PASTE THIS BELOW YOUR EXISTING CODE in the same Apps Script file.
+* It reuses buildColMap_(), getSheetByGid_(), formatOrdinalDate_(),
+* and the SHEET_GID constant already defined above — no changes needed
+* to what you already have.
+*
+* This is a standalone function (not named onEdit), so it will NOT run
+* automatically. You need to register it as an installable trigger:
+*   1. Save this file.
+*   2. Click the clock icon (Triggers) on the left.
+*   3. Add Trigger:
+*        Function: blockPastDateEntries
+*        Event source: From spreadsheet
+*        Event type: On edit
+*   4. Save, and approve the permission prompt if asked.
+*
+* RULE: today's column can be filled until CUTOFF_HOUR (24-hr, local
+* time). After that hour, today's column locks too — only tomorrow
+* onward stays editable. Change CUTOFF_HOUR below if 11 AM ever changes.
+*
+* NOTE: this relies on the script project's time zone matching your
+* local time zone. Check via the gear icon (Project Settings) ->
+* "Time zone" -> should be your local zone (e.g. (GMT+5:30) Kolkata).
+*/
+
+
+var CUTOFF_HOUR = 9; // 24-hr format — 11 = 11 AM
+
+
+function blockPastDateEntries(e) {
+ try {
+   var range = e.range;
+   var sheet = range.getSheet();
+   if (sheet.getSheetId() !== SHEET_GID) return; // ignore other tabs
+
+
+   var startRow = range.getRow();
+   var numRows = range.getNumRows();
+   var startCol = range.getColumn();
+   var numCols = range.getNumColumns();
+   var lastCol = sheet.getLastColumn();
+
+
+   var now = new Date();
+   var today = new Date();
+   today.setHours(0, 0, 0, 0);
+   var todayIsLocked = now.getHours() >= CUTOFF_HOUR;
+
+
+   // Column A values from row 1 down to the edited row, to locate the
+   // nearest "Employee No" header above each edited row.
+   var colA = sheet.getRange(1, 1, startRow, 1).getDisplayValues();
+
+
+   var blockedAny = false;
+   var blockedDateStr = '';
+
+
+   var isSingleCellEdit = (numRows === 1 && numCols === 1);
+
+
+   for (var r = 0; r < numRows; r++) {
+     var sheetRow = startRow + r;
+
+
+     var headerRowIndex = -1;
+     for (var k = sheetRow - 1; k >= 1; k--) {
+       if (colA[k - 1][0] === 'Employee No') { headerRowIndex = k; break; }
+     }
+     if (headerRowIndex === -1) continue; // not a data row under any header
+
+
+     var header1 = sheet.getRange(headerRowIndex - 1, 1, 1, lastCol).getDisplayValues()[0];
+     var header2 = sheet.getRange(headerRowIndex, 1, 1, lastCol).getDisplayValues()[0];
+     var colMap = buildColMap_(header1, header2);
+
+
+     var monthYear = sheet.getRange(sheetRow, 3, 1, 2).getDisplayValues()[0];
+     var month = parseInt(monthYear[0], 10);
+     var year = parseInt(monthYear[1], 10);
+     if (isNaN(month) || isNaN(year)) continue;
+
+
+     for (var c = 0; c < numCols; c++) {
+       var sheetCol = startCol + c;
+       var info = colMap[sheetCol - 1];
+       if (!info) continue; // not a BF/L/D column (e.g. Name/Month/Year/Menu col)
+
+
+       var cellDate = new Date(year, month - 1, info.day);
+       cellDate.setHours(0, 0, 0, 0);
+
+
+       var isPast = cellDate.getTime() < today.getTime();
+       var isTodayLocked = cellDate.getTime() === today.getTime() && todayIsLocked;
+
+
+       if (isPast || isTodayLocked) {
+         var cell = sheet.getRange(sheetRow, sheetCol);
+         // For a single-cell edit we know exactly what was there before
+         // (e.oldValue) and restore that — nothing is lost. For a
+         // multi-cell paste we have no per-cell history, so fall back
+         // to clearing (rare case; normal typing is always single-cell).
+         if (isSingleCellEdit) {
+           revertCellValue_(cell, e.oldValue);
+         } else {
+           clearCellValue_(cell);
+         }
+         blockedAny = true;
+         blockedDateStr = formatOrdinalDate_(cellDate);
+       }
+     }
+   }
+
+
+   if (blockedAny) {
+     SpreadsheetApp.flush(); // force the clear to render immediately
+     SpreadsheetApp.getUi().alert(
+       'Meal count has already been provided. Recheck once again the date.'
+     );
+   }
+ } catch (err) {
+   // Never let a script error block normal editing of the sheet.
+ }
+}
+
+
+// Clears a cell correctly whether it's plain text/Y-N or a Sheets
+// checkbox (checkboxes need setValue(false), not setValue('')), and
+// resets any leftover background color (e.g. a green fill). Used only
+// when we have no prior value to restore to (multi-cell paste, or the
+// cell was genuinely blank before).
+function clearCellValue_(cell) {
+ var rule = cell.getDataValidation();
+ if (rule && rule.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.CHECKBOX) {
+   cell.setValue(false);
+ } else {
+   cell.clearContent();
+ }
+ cell.setBackground(null);
+}
+
+
+// Restores a single cell to exactly what it held before this edit —
+// this is the real "lock": the attempted change is undone, and
+// whatever was legitimately filled earlier is preserved untouched.
+function revertCellValue_(cell, oldValueRaw) {
+ var rule = cell.getDataValidation();
+ var isCheckbox = rule && rule.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.CHECKBOX;
+
+
+ if (oldValueRaw === undefined || oldValueRaw === null || oldValueRaw === '') {
+   // Nothing was there before — genuinely a new, blocked entry.
+   clearCellValue_(cell);
+   return;
+ }
+
+
+ if (isCheckbox) {
+   cell.setValue(String(oldValueRaw).toUpperCase() === 'TRUE');
+ } else {
+   cell.setValue(oldValueRaw);
+ }
+}
+
+
+
+
+
